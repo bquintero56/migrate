@@ -1,22 +1,23 @@
 """
-Copia repositorios de GitLab (origen) a otro grupo/GitLab (destino) con el mismo nombre,
+Copia repositorios de GitLab a un grupo del mismo GitLab, con el mismo nombre,
 incluyendo TODAS las ramas, tags e historial.
 
-- Si el repo ya existe en el destino, avisa y NO lo copia.
-- Si no existe, crea el proyecto en el grupo destino (mismo nombre, descripcion y visibilidad),
-  sube todas las ramas y tags, y deja la misma rama por defecto.
+- Pones la URL de cada repo a copiar (REPOS) y la URL del grupo destino (DESTINO).
+- Si el repo ya existe en el grupo destino, avisa y NO lo copia.
+- Si no existe, lo crea (mismo nombre, descripcion y visibilidad), sube todas las ramas
+  y tags, y deja la misma rama por defecto.
 
 Requisitos:
     - git instalado
     - pip install requests
-    - Token de GitLab (Personal Access Token) con permisos:
-        origen : read_api + read_repository
-        destino: api + write_repository
+    - Token de GitLab (Personal Access Token) con permisos: api + write_repository
+      y rol Maintainer (o mas) en el grupo destino.
 
 Uso:
-    python migrar_gitlab.py                        # usa la lista REPOS de abajo
-    python migrar_gitlab.py --repos https://gitlab.empresa.com/grupo/proyecto
-    python migrar_gitlab.py --grupo pais/test/migracion --simular
+    python migrar_gitlab.py --simular     # no crea nada, solo muestra lo que haria
+    python migrar_gitlab.py
+    python migrar_gitlab.py --destino https://gitlab.empresa.com/pais/test/migracion \
+                            --repos https://gitlab.empresa.com/grupo/proyecto
 """
 
 import argparse
@@ -28,32 +29,24 @@ import stat
 import subprocess
 import sys
 import tempfile
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
 # ======================= CONFIGURACION =======================
-ORIGEN = {
-    "url": "https://gitlab-origen.com",   # URL base del GitLab origen
-    "token": "",                           # si queda vacio se pide al ejecutar
-}
-DESTINO = {
-    "url": "https://gitlab-destino.com",  # puede ser el mismo GitLab que el origen
-    "token": "",
-}
+# URL del GRUPO donde se van a crear los repos copiados (el grupo debe existir).
+DESTINO = "https://gitlab.empresa.com/pais/test/migracion"
 
-# Grupo del GitLab destino donde se crearan los repos (ej: "pais/test/migracion").
-# Vacio = en el espacio personal del usuario del token. Se puede sobreescribir con --grupo.
-# El grupo debe existir en el destino.
-GRUPO_DESTINO = ""
-
-# Repos a copiar: URL completa o ruta (ej: "grupo/proyecto").
+# URLs de los repos a copiar (tal como se ven en el navegador).
 REPOS = [
-    # "https://gitlab-origen.com/grupo/proyecto-1",
-    # "grupo/sub/proyecto-2",
+    # "https://gitlab.empresa.com/grupo/proyecto-1",
+    # "https://gitlab.empresa.com/otro-grupo/sub/proyecto-2",
 ]
 
-# Proxy usado para conectarse a los dos GitLab (API y git):
+# Token de GitLab (si queda vacio se pide al ejecutar).
+TOKEN = ""
+
+# Proxy:
 #   ""          -> usa el proxy del sistema (variables HTTP_PROXY / HTTPS_PROXY) si existe
 #   "http://proxy.empresa.com:8080"              -> usa ese proxy
 #   "http://usuario:clave@proxy.empresa.com:8080" -> proxy con autenticacion
@@ -74,12 +67,26 @@ def descripcion_proxy():
     return "proxy del sistema (si hay)"
 
 
+def separar_url(url):
+    """'https://gitlab.x.com/grupo/sub/proy.git' -> ('https://gitlab.x.com', 'grupo/sub/proy')"""
+    u = urlparse(url.strip())
+    if u.scheme not in ("http", "https") or not u.netloc:
+        raise ValueError(f"URL no valida: {url!r} (debe empezar con http:// o https://)")
+    ruta = u.path.split("/-/")[0].strip("/")  # quita cosas como /-/tree/main
+    if ruta.startswith("groups/"):            # URLs antiguas de grupo: /groups/pais/test
+        ruta = ruta[len("groups/"):]
+    if ruta.endswith(".git"):
+        ruta = ruta[:-4]
+    if not ruta:
+        raise ValueError(f"a la URL le falta la ruta del grupo/repo: {url!r}")
+    return f"{u.scheme}://{u.netloc}", ruta
+
+
 class GitLab:
-    def __init__(self, nombre, url, token):
-        self.nombre = nombre
+    def __init__(self, url, token):
         self.url = url.rstrip("/")
         if not token:
-            token = getpass.getpass(f"Token de GitLab para {nombre} ({self.url}): ")
+            token = getpass.getpass(f"Token de GitLab ({self.url}): ")
         self.token = token
         self.basic = base64.b64encode(f"oauth2:{token}".encode()).decode()
         self.usuario = None
@@ -100,14 +107,14 @@ class GitLab:
         try:
             r = self.api("GET", "/user")
         except requests.exceptions.ProxyError as e:
-            sys.exit(f"[ERROR] {self.nombre}: fallo el proxy ({descripcion_proxy()}): {e}")
+            sys.exit(f"[ERROR] fallo el proxy ({descripcion_proxy()}): {e}")
         except requests.exceptions.ConnectionError as e:
-            sys.exit(f"[ERROR] {self.nombre}: no se pudo conectar a {self.url} ({descripcion_proxy()}): {e}")
+            sys.exit(f"[ERROR] no se pudo conectar a {self.url} ({descripcion_proxy()}): {e}")
         if r.status_code in (401, 403):
-            sys.exit(f"[ERROR] {self.nombre}: token invalido o sin permisos (HTTP {r.status_code})")
+            sys.exit(f"[ERROR] token invalido o sin permisos (HTTP {r.status_code})")
         r.raise_for_status()
         self.usuario = r.json()["username"]
-        print(f"  [OK] Conectado a {self.nombre}: {self.url} como {self.usuario}  ({descripcion_proxy()})")
+        print(f"  [OK] Conectado a {self.url} como {self.usuario}  ({descripcion_proxy()})")
 
     def _get(self, tipo, ruta_completa):
         r = self.api("GET", f"/{tipo}/{quote(ruta_completa, safe='')}")
@@ -131,7 +138,7 @@ class GitLab:
 
 
 def git(gl, args, cwd=None):
-    """Ejecuta git autenticando contra el GitLab indicado y usando el proxy configurado."""
+    """Ejecuta git autenticando con el token y usando el proxy configurado."""
     cmd = ["git",
            "-c", f"http.extraHeader=Authorization: Basic {gl.basic}",
            "-c", "credential.helper="]
@@ -155,21 +162,6 @@ def git(gl, args, cwd=None):
     return r.stdout
 
 
-def ruta_desde_entrada(entrada, base_url):
-    """Convierte 'https://gitlab/grupo/proy(.git)' o 'grupo/proy' en 'grupo/proy'."""
-    e = entrada.strip()
-    if e.lower().startswith(("http://", "https://")):
-        if not e.lower().startswith(base_url.lower() + "/"):
-            raise ValueError(f"la URL no pertenece al GitLab origen ({base_url})")
-        e = e[len(base_url) + 1:]
-    elif e.startswith("git@"):
-        e = e.split(":", 1)[1]
-    e = e.split("/-/")[0].strip("/")  # quita cosas como /-/tree/main
-    if e.endswith(".git"):
-        e = e[:-4]
-    return e
-
-
 def borrar_carpeta(ruta):
     def forzar(func, path, _exc):
         os.chmod(path, stat.S_IWRITE)  # en Windows git deja archivos de solo lectura
@@ -177,74 +169,71 @@ def borrar_carpeta(ruta):
     shutil.rmtree(ruta, onerror=forzar)
 
 
-def migrar(origen, destino, entrada, grupo, simular):
-    ruta_origen = ruta_desde_entrada(entrada, origen.url)
-    print(f"\n>> {ruta_origen}")
+def migrar(gl, url_repo, grupo, simular):
+    base, ruta_origen = separar_url(url_repo)
+    if base.lower() != gl.url.lower():
+        raise RuntimeError(f"el repo no esta en el mismo GitLab que el destino ({gl.url})")
 
-    src = origen.proyecto(ruta_origen)
+    src = gl.proyecto(ruta_origen)
     if src is None:
-        raise RuntimeError("no existe en el GitLab origen (o el token no tiene acceso)")
+        raise RuntimeError("el repo no existe (o el token no tiene acceso)")
 
-    namespace = grupo["full_path"] if grupo else destino.usuario
-    ruta_destino = f"{namespace}/{src['path']}"
-    print(f"    destino: {destino.url}/{ruta_destino}")
+    ruta_destino = f"{grupo['full_path']}/{src['path']}"
+    print(f"    {ruta_origen}  ->  {ruta_destino}")
 
-    if destino.proyecto(ruta_destino) is not None:
-        print("    YA EXISTE en el destino -> no se copia")
+    if gl.proyecto(ruta_destino) is not None:
+        print("    YA EXISTE en el grupo destino -> no se copia")
         return "YA EXISTE (omitido)"
 
     if simular:
-        print(f"    [SIMULACION] Se crearia '{src['name']}' y se subirian todas las ramas y tags "
+        print(f"    [SIMULACION] Se crearia '{src['name']}' con todas sus ramas y tags "
               f"(rama por defecto: {src.get('default_branch')})")
         return "SE COPIARIA"
 
-    # 1) Crear el proyecto vacio en el destino
-    datos = {
+    # 1) Crear el proyecto vacio en el grupo destino
+    r = gl.api("POST", "/projects", data={
         "name": src["name"],
         "path": src["path"],
+        "namespace_id": grupo["id"],
         "description": src.get("description") or "",
         "visibility": src.get("visibility", "private"),
-    }
-    if grupo:
-        datos["namespace_id"] = grupo["id"]
-    r = destino.api("POST", "/projects", data=datos)
+    })
     if r.status_code != 201:
-        raise RuntimeError(f"no se pudo crear el proyecto en destino: HTTP {r.status_code} {r.text[:300]}")
+        raise RuntimeError(f"no se pudo crear el proyecto: HTTP {r.status_code} {r.text[:300]}")
     nuevo = r.json()
-    print("    Proyecto creado en destino")
+    print("    Proyecto creado")
 
-    # 2) Clonar en espejo y subir ramas + tags
+    # 2) Clonar en espejo y subir todas las ramas + tags
     tmp = tempfile.mkdtemp(prefix="migrar_gitlab_")
     try:
         carpeta = os.path.join(tmp, "repo.git")
-        print("    Clonando desde origen (todas las ramas y tags)...")
-        git(origen, ["clone", "--mirror", origen.url_git(ruta_origen), carpeta])
-        ramas = len(git(origen, ["for-each-ref", "refs/heads"], cwd=carpeta).splitlines())
-        tags = len(git(origen, ["for-each-ref", "refs/tags"], cwd=carpeta).splitlines())
-        print(f"    Subiendo al destino {ramas} rama(s) y {tags} tag(s)...")
-        if ramas == 0 and tags == 0:
-            print("    (el repo origen esta vacio)")
+        print("    Clonando (todas las ramas y tags)...")
+        git(gl, ["clone", "--mirror", gl.url_git(ruta_origen), carpeta])
+        ramas = len(git(gl, ["for-each-ref", "refs/heads"], cwd=carpeta).splitlines())
+        tags = len(git(gl, ["for-each-ref", "refs/tags"], cwd=carpeta).splitlines())
+        print(f"    Subiendo {ramas} rama(s) y {tags} tag(s)...")
+        if ramas or tags:
+            git(gl, ["push", gl.url_git(ruta_destino),
+                     "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"], cwd=carpeta)
         else:
-            git(destino, ["push", destino.url_git(ruta_destino),
-                          "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"], cwd=carpeta)
+            print("    (el repo origen esta vacio)")
     except Exception as e:
-        raise RuntimeError(f"{e}\n    (el proyecto vacio quedo creado en destino: {nuevo['web_url']})")
+        raise RuntimeError(f"{e}\n    (el proyecto quedo creado vacio: {nuevo['web_url']})")
     finally:
         borrar_carpeta(tmp)
 
     # 3) Misma rama por defecto que en el origen
-    rama_def = src.get("default_branch")
-    if rama_def:
-        destino.api("PUT", f"/projects/{nuevo['id']}", data={"default_branch": rama_def})
+    if src.get("default_branch"):
+        gl.api("PUT", f"/projects/{nuevo['id']}", data={"default_branch": src["default_branch"]})
 
     print(f"    COPIADO -> {nuevo['web_url']}")
     return f"COPIADO ({ramas} ramas, {tags} tags)"
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Copia repos de GitLab a otro grupo/GitLab con todas sus ramas")
-    ap.add_argument("--repos", nargs="+", help="URLs o rutas de los repos a copiar")
-    ap.add_argument("--grupo", default=GRUPO_DESTINO, help="Grupo destino (ej: pais/test/migracion)")
+    ap = argparse.ArgumentParser(description="Copia repos de GitLab a un grupo con todas sus ramas")
+    ap.add_argument("--destino", default=DESTINO, help="URL del grupo destino")
+    ap.add_argument("--repos", nargs="+", help="URLs de los repos a copiar")
     ap.add_argument("--simular", action="store_true", help="No crea nada, solo muestra lo que haria")
     args = ap.parse_args()
 
@@ -255,31 +244,26 @@ def main():
 
     print("=== Migracion de repositorios GitLab ===")
     if args.simular:
-        print("*** MODO SIMULACION: no se creara nada en el destino ***")
+        print("*** MODO SIMULACION: no se creara nada ***")
 
-    repos = [r for r in (args.repos or REPOS) if r.strip()]
+    repos = [r.strip() for r in (args.repos or REPOS) if r.strip()]
     if not repos:
         sys.exit("No hay repos para copiar: llena la lista REPOS o usa --repos")
 
-    origen = GitLab("GitLab origen", ORIGEN["url"], ORIGEN["token"])
-    if DESTINO["url"].rstrip("/") == origen.url and not DESTINO["token"]:
-        destino = GitLab("GitLab destino", DESTINO["url"], origen.token)  # mismo GitLab, mismo token
-    else:
-        destino = GitLab("GitLab destino", DESTINO["url"], DESTINO["token"])
-    origen.conectar()
-    destino.conectar()
+    try:
+        base, ruta_grupo = separar_url(args.destino)
+    except ValueError as e:
+        sys.exit(f"[ERROR] DESTINO: {e}")
 
-    grupo_ruta = args.grupo.strip("/")
-    grupo = None
-    if grupo_ruta:
-        grupo = destino.grupo(grupo_ruta)
-        if grupo is None:
-            sys.exit(f"[ERROR] El grupo '{grupo_ruta}' no existe en el GitLab destino (o no tienes acceso).")
-        print(f"  Grupo destino: {grupo['full_path']}")
-    else:
-        print(f"  Grupo destino: espacio personal de {destino.usuario}")
+    gl = GitLab(base, TOKEN)
+    gl.conectar()
 
-    print(f"\nSe procesaran {len(repos)} repo(s):")
+    grupo = gl.grupo(ruta_grupo)
+    if grupo is None:
+        sys.exit(f"[ERROR] El grupo destino '{ruta_grupo}' no existe (o el token no tiene acceso).")
+    print(f"  Grupo destino: {grupo['full_path']}")
+
+    print(f"\nSe copiaran {len(repos)} repo(s) a '{grupo['full_path']}':")
     for r in repos:
         print(f"  - {r}")
     if not args.simular and input("Continuar? (s/n): ").strip().lower() not in ("s", "si", "y", "yes"):
@@ -287,14 +271,15 @@ def main():
         return
 
     resumen = []
-    for entrada in repos:
+    for url_repo in repos:
+        print(f"\n>> {url_repo}")
         try:
-            res = migrar(origen, destino, entrada, grupo, args.simular)
+            res = migrar(gl, url_repo, grupo, args.simular)
         except Exception as e:
-            msg = origen.ocultar(destino.ocultar(str(e)))
+            msg = gl.ocultar(str(e))
             print(f"    ERROR: {msg}")
             res = "ERROR: " + msg.splitlines()[0]
-        resumen.append((entrada, res))
+        resumen.append((url_repo, res))
 
     print("\n=== RESUMEN ===")
     ancho = max(len(n) for n, _ in resumen)
