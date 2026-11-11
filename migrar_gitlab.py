@@ -111,7 +111,20 @@ class GitLab:
         except requests.exceptions.ConnectionError as e:
             sys.exit(f"[ERROR] no se pudo conectar a {self.url} ({descripcion_proxy()}): {e}")
         if r.status_code in (401, 403):
-            sys.exit(f"[ERROR] token invalido o sin permisos (HTTP {r.status_code})")
+            detalle = self.ocultar(r.text.strip())[:500] or "(sin contenido)"
+            es_json = "json" in r.headers.get("Content-Type", "")
+            print(f"[ERROR] HTTP {r.status_code} al validar el token en {self.url}/api/v4/user")
+            print(f"        Servidor : {r.headers.get('Server', '?')}")
+            print(f"        Via      : {r.headers.get('Via', '-')}")
+            print(f"        Respuesta: {detalle}")
+            if not es_json:
+                print("        -> La respuesta NO es de la API de GitLab (no es JSON). Probablemente la")
+                print("           bloquea el PROXY o un firewall. Prueba con PROXY = \"sin\" o con otro proxy.")
+            elif r.status_code == 401:
+                print("        -> Token invalido, expirado o mal copiado.")
+            else:
+                print("        -> GitLab rechazo el token: revisa que tenga el scope 'api' (o 'read_user').")
+            sys.exit(1)
         r.raise_for_status()
         self.usuario = r.json()["username"]
         print(f"  [OK] Conectado a {self.url} como {self.usuario}  ({descripcion_proxy()})")
