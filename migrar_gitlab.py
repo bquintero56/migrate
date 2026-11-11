@@ -46,6 +46,13 @@ REPOS = [
 # Token de GitLab (si queda vacio se pide al ejecutar).
 TOKEN = ""
 
+# URL base de tu GitLab (donde esta instalado). Ejemplos:
+#   "https://gitlab.empresa.com"
+#   "https://servidor.empresa.com/gitlab"   (si esta montado en una subruta)
+# Vacio = se detecta solo a partir de la URL de DESTINO.
+# Para confirmarla: abre <GITLAB_URL>/api/v4/version en el navegador; debe responder GitLab.
+GITLAB_URL = ""
+
 # Proxy:
 #   ""          -> usa el proxy del sistema (variables HTTP_PROXY / HTTPS_PROXY) si existe
 #   "http://proxy.empresa.com:8080"              -> usa ese proxy
@@ -67,19 +74,49 @@ def descripcion_proxy():
     return "proxy del sistema (si hay)"
 
 
-def separar_url(url):
-    """'https://gitlab.x.com/grupo/sub/proy.git' -> ('https://gitlab.x.com', 'grupo/sub/proy')"""
+def validar_url(url):
     u = urlparse(url.strip())
     if u.scheme not in ("http", "https") or not u.netloc:
         raise ValueError(f"URL no valida: {url!r} (debe empezar con http:// o https://)")
-    ruta = u.path.split("/-/")[0].strip("/")  # quita cosas como /-/tree/main
-    if ruta.startswith("groups/"):            # URLs antiguas de grupo: /groups/pais/test
+    return u
+
+
+def ruta_relativa(url, base):
+    """Ruta del grupo/repo dentro del GitLab.
+    ('https://srv.com/gitlab/grupo/proy.git', 'https://srv.com/gitlab') -> 'grupo/proy'"""
+    ruta = validar_url(url).path
+    prefijo = urlparse(base).path.rstrip("/")
+    if prefijo and (ruta + "/").lower().startswith(prefijo.lower() + "/"):
+        ruta = ruta[len(prefijo):]
+    ruta = ruta.split("/-/")[0].strip("/")  # quita cosas como /-/tree/main
+    if ruta.startswith("groups/"):          # URLs antiguas de grupo: /groups/pais/test
         ruta = ruta[len("groups/"):]
     if ruta.endswith(".git"):
         ruta = ruta[:-4]
     if not ruta:
         raise ValueError(f"a la URL le falta la ruta del grupo/repo: {url!r}")
-    return f"{u.scheme}://{u.netloc}", ruta
+    return ruta
+
+
+def detectar_gitlab_url(url_destino, token):
+    """Prueba 'https://host', 'https://host/seg1', ... hasta encontrar donde responde la API de GitLab."""
+    u = validar_url(url_destino)
+    host = f"{u.scheme}://{u.netloc}"
+    segmentos = [s for s in u.path.split("/-/")[0].split("/") if s]
+    for i in range(len(segmentos)):
+        candidata = host + "".join("/" + s for s in segmentos[:i])
+        try:
+            r = GitLab(candidata, token).api("GET", "/version")
+        except requests.exceptions.RequestException:
+            continue
+        if r.status_code in (200, 401, 403) and "json" in r.headers.get("Content-Type", ""):
+            try:
+                datos = r.json()
+            except ValueError:
+                continue
+            if isinstance(datos, dict) and ("version" in datos or "message" in datos):
+                return candidata
+    return None
 
 
 class GitLab:
@@ -183,9 +220,7 @@ def borrar_carpeta(ruta):
 
 
 def migrar(gl, url_repo, grupo, simular):
-    base, ruta_origen = separar_url(url_repo)
-    if base.lower() != gl.url.lower():
-        raise RuntimeError(f"el repo no esta en el mismo GitLab que el destino ({gl.url})")
+    ruta_origen = ruta_relativa(url_repo, gl.url)
 
     src = gl.proyecto(ruta_origen)
     if src is None:
@@ -264,11 +299,28 @@ def main():
         sys.exit("No hay repos para copiar: llena la lista REPOS o usa --repos")
 
     try:
-        base, ruta_grupo = separar_url(args.destino)
+        destino_url = validar_url(args.destino)
     except ValueError as e:
         sys.exit(f"[ERROR] DESTINO: {e}")
 
-    gl = GitLab(base, TOKEN)
+    token = TOKEN or getpass.getpass("Token de GitLab: ")
+
+    if GITLAB_URL.strip():
+        base = GITLAB_URL.strip().rstrip("/")
+    else:
+        print("Detectando la URL de la API de GitLab...")
+        base = detectar_gitlab_url(args.destino, token)
+        if base is None:
+            base = f"{destino_url.scheme}://{destino_url.netloc}"
+            print(f"  [!] No se pudo detectar; se usara {base}. Si falla, configura GITLAB_URL.")
+    print(f"  API de GitLab: {base}/api/v4")
+
+    try:
+        ruta_grupo = ruta_relativa(args.destino, base)
+    except ValueError as e:
+        sys.exit(f"[ERROR] DESTINO: {e}")
+
+    gl = GitLab(base, token)
     gl.conectar()
 
     grupo = gl.grupo(ruta_grupo)
