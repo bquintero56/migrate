@@ -33,6 +33,12 @@ DESTINO = {
     "usuario": "admin",
     "token": "",
 }
+# Proxy usado para conectarse a los dos Jenkins:
+#   ""          -> usa el proxy del sistema (variables HTTP_PROXY / HTTPS_PROXY) si existe
+#   "http://proxy.empresa.com:8080"              -> usa ese proxy
+#   "http://usuario:clave@proxy.empresa.com:8080" -> proxy con autenticacion
+#   "sin"       -> conexion directa, ignora cualquier proxy del sistema
+PROXY = ""
 VERIFICAR_SSL = True  # ponlo en False si usan certificados autofirmados
 
 # Carpeta del Jenkins 2 donde se copiaran los jobs (ej: "equipo/backend").
@@ -51,7 +57,7 @@ FOLDER_CLASS = "com.cloudbees.hudson.plugins.folder.Folder"
 
 
 class Jenkins:
-    def __init__(self, nombre, url, usuario, token):
+    def __init__(self, nombre, url, usuario, token, proxy=PROXY):
         self.nombre = nombre
         self.url = url.rstrip("/")
         if not token:
@@ -59,9 +65,24 @@ class Jenkins:
         self.s = requests.Session()
         self.s.auth = (usuario, token)
         self.s.verify = VERIFICAR_SSL
+        proxy = (proxy or "").strip()
+        if proxy.lower() == "sin":
+            self.s.trust_env = False  # ignora HTTP_PROXY/HTTPS_PROXY del sistema
+            self.proxy_desc = "sin proxy"
+        elif proxy:
+            self.s.proxies = {"http": proxy, "https": proxy}
+            # no mostrar la clave del proxy en pantalla
+            self.proxy_desc = "proxy " + (proxy.split("@")[-1] if "@" in proxy else proxy)
+        else:
+            self.proxy_desc = "proxy del sistema (si hay)"
 
     def conectar(self):
-        r = self.s.get(f"{self.url}/api/json", params={"tree": "mode"}, timeout=30)
+        try:
+            r = self.s.get(f"{self.url}/api/json", params={"tree": "mode"}, timeout=30)
+        except requests.exceptions.ProxyError as e:
+            sys.exit(f"[ERROR] {self.nombre}: fallo el proxy ({self.proxy_desc}): {e}")
+        except requests.exceptions.ConnectionError as e:
+            sys.exit(f"[ERROR] {self.nombre}: no se pudo conectar a {self.url} ({self.proxy_desc}): {e}")
         if r.status_code in (401, 403):
             sys.exit(f"[ERROR] {self.nombre}: usuario o token invalidos (HTTP {r.status_code})")
         r.raise_for_status()
@@ -70,7 +91,7 @@ class Jenkins:
         if c.status_code == 200:
             d = c.json()
             self.s.headers[d["crumbRequestField"]] = d["crumb"]
-        print(f"  [OK] Conectado a {self.nombre}: {self.url}")
+        print(f"  [OK] Conectado a {self.nombre}: {self.url}  ({self.proxy_desc})")
 
     @staticmethod
     def ruta(nombre_completo):
